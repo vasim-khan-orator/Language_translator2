@@ -1,0 +1,4 @@
+ollama
+nvidia-riva-client
+numpy
+sounddevice

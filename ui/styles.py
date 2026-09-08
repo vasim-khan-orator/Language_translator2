@@ -1,0 +1,19 @@
+WINDOW_TITLE = "Real-Time Language Translator"
+
+WINDOW_WIDTH = 1100
+WINDOW_HEIGHT = 700
+
+BACKGROUND = "#1e1e1e"
+PANEL_BACKGROUND = "#252526"
+TEXT_BACKGROUND = "#181818"
+
+TEXT_COLOR = "#ffffff"
+SECONDARY_TEXT = "#aaaaaa"
+ACCENT_COLOR = "#4CAF50"
+WARNING_COLOR = "#FFC107"
+
+FONT_TITLE = ("Arial", 22, "bold")
+FONT_SECTION = ("Arial", 14, "bold")
+FONT_TEXT = ("Arial", 16)
+FONT_SMALL = ("Arial", 11)
+FONT_METRIC = ("Arial", 13)
