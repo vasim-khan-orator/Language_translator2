@@ -1,6 +1,7 @@
 import threading
 import time
 
+
 from audio.microphone import Microphone
 from riva.asr import RivaASR
 
@@ -8,12 +9,18 @@ from conversation.manager import ConversationManager
 from conversation.utterance import UtteranceManager
 
 from translation.ollama import OllamaTranslator
-from translation.worker import TranslationWorker
+from translation.chunk_worker import ChunkWorker
+from translation.final_worker import FinalTranslationWorker
+from translation.refinement_worker import RefinementWorker
 
 from config import (
     SOURCE_LANGUAGE,
     TARGET_LANGUAGE,
     SILENCE_TIMEOUT,
+    CHUNK_MAX_WORKERS,
+    REFINEMENT_MAX_WORKERS,
+    CHUNK_INTERVAL,
+    REFINEMENT_INTERVAL,
 )
 
 
@@ -36,17 +43,39 @@ def run_translator(bridge=None):
         silence_timeout=SILENCE_TIMEOUT
     )
 
-    # =========================================================
-    # OLLAMA
-    # =========================================================
-
     translator = OllamaTranslator()
 
-    translation_worker = TranslationWorker(
+    # =========================================================
+    # TRANSLATION WORKERS
+    # =========================================================
+
+    chunk_worker = ChunkWorker(
         translator=translator,
         conversation=conversation,
-        renderer=None,
         bridge=bridge,
+        max_workers=CHUNK_MAX_WORKERS,
+        chunk_interval=CHUNK_INTERVAL,
+    )
+
+    # ---------------------------------------------------------
+    # Refinement worker must be created BEFORE final worker
+    # because FinalTranslationWorker receives its callback.
+    # ---------------------------------------------------------
+
+    refinement_worker = RefinementWorker(
+        translator=translator,
+        context_manager=conversation,
+        bridge=bridge,
+        refresh_interval=REFINEMENT_INTERVAL,
+        max_workers=REFINEMENT_MAX_WORKERS,
+    )
+
+    final_worker = FinalTranslationWorker(
+        translator=translator,
+        conversation=conversation,
+        bridge=bridge,
+        refinement_callback=refinement_worker.submit,
+        max_workers=2,
     )
 
     # =========================================================
@@ -55,11 +84,21 @@ def run_translator(bridge=None):
 
     app_running = True
 
+    # Current active ConversationTurn.
+    #
+    # This is created as soon as the first Riva FINAL
+    # segment of an utterance arrives.
+    active_turn = None
+
+    active_turn_lock = threading.Lock()
+
     # =========================================================
     # UTTERANCE MONITOR
     # =========================================================
 
     def utterance_monitor():
+
+        nonlocal active_turn
 
         while app_running:
 
@@ -69,38 +108,67 @@ def run_translator(bridge=None):
 
             if complete_text:
 
-                # -------------------------------------------------
-                # CREATE CONVERSATION TURN
-                # -------------------------------------------------
+                with active_turn_lock:
 
-                turn = conversation.add_turn(
-                    source_text=complete_text
-                )
+                    turn = active_turn
+                    active_turn = None
 
-                if turn:
+                if turn is not None:
 
                     # -------------------------------------------------
-                    # SEND FINAL SOURCE TO UI
+                    # Make absolutely sure the completed source is
+                    # stored in the same conversation turn.
                     # -------------------------------------------------
 
-                    if bridge is not None:
+                    conversation.update_source_text(
+                        turn_id=turn.id,
+                        source_text=complete_text,
+                    )
 
-                        bridge.source_final(
-                            complete_text
+                    turn = conversation.get_turn(
+                        turn.id
+                    )
+
+                    if turn is not None:
+
+                        # -------------------------------------------------
+                        # FINAL SOURCE TO UI
+                        # -------------------------------------------------
+
+                        if bridge is not None:
+
+                            bridge.source_final(
+                                complete_text
+                            )
+
+                        # -------------------------------------------------
+                        # FINAL TRANSLATION
+                        # -------------------------------------------------
+
+                        final_worker.submit(
+                            turn
                         )
 
-                    # -------------------------------------------------
-                    # SEND TO TRANSLATION WORKER
-                    # -------------------------------------------------
+                        # -------------------------------------------------
+                        # IMPORTANT:
+                        #
+                        # Do NOT submit directly to RefinementWorker here.
+                        #
+                        # FinalTranslationWorker is now responsible for
+                        # triggering refinement only after the final
+                        # translation has been successfully accepted.
+                        # -------------------------------------------------
 
-                    translation_worker.submit(
-                        turn
-                    )
+                # -----------------------------------------------------
+                # Prepare ChunkWorker for next utterance.
+                # -----------------------------------------------------
+
+                chunk_worker.reset_turn()
 
             time.sleep(0.05)
 
     # =========================================================
-    # START MONITOR THREAD
+    # MONITOR THREAD
     # =========================================================
 
     monitor_thread = threading.Thread(
@@ -115,19 +183,26 @@ def run_translator(bridge=None):
         # =====================================================
 
         if bridge is not None:
-            bridge.status("STARTING")
+
+            bridge.status(
+                "STARTING"
+            )
 
         # =====================================================
-        # START MICROPHONE
+        # MICROPHONE
         # =====================================================
 
         microphone.start()
 
         # =====================================================
-        # START TRANSLATION WORKER
+        # START WORKERS
         # =====================================================
 
-        translation_worker.start()
+        chunk_worker.start()
+
+        final_worker.start()
+
+        refinement_worker.start()
 
         # =====================================================
         # START UTTERANCE MONITOR
@@ -136,7 +211,10 @@ def run_translator(bridge=None):
         monitor_thread.start()
 
         if bridge is not None:
-            bridge.status("LISTENING")
+
+            bridge.status(
+                "LISTENING"
+            )
 
         # =====================================================
         # RIVA STREAMING
@@ -147,25 +225,50 @@ def run_translator(bridge=None):
         ):
 
             # -------------------------------------------------
-            # INTERIM
+            # INTERIM RESULT
             # -------------------------------------------------
 
             if not result.is_final:
 
-                current_text = (
+                stable_text = (
                     utterance.get_current_text()
                 )
+
+                interim_text = (
+                    result.text.strip()
+                )
+
+                # Display stable FINAL text + current
+                # interim hypothesis.
+                if interim_text:
+
+                    if stable_text:
+
+                        display_text = (
+                            f"{stable_text} "
+                            f"{interim_text}"
+                        )
+
+                    else:
+
+                        display_text = (
+                            interim_text
+                        )
+
+                else:
+
+                    display_text = stable_text
 
                 if bridge is not None:
 
                     bridge.source_partial(
-                        current_text
+                        display_text.strip()
                     )
 
                 continue
 
             # -------------------------------------------------
-            # FINAL RIVA SEGMENT
+            # RIVA FINAL SEGMENT
             # -------------------------------------------------
 
             text = result.text.strip()
@@ -174,27 +277,86 @@ def run_translator(bridge=None):
                 continue
 
             # -------------------------------------------------
-            # ADD STABLE RIVA SEGMENT
+            # ADD STABLE SEGMENT
             # -------------------------------------------------
 
             utterance.add_final_segment(
                 text
             )
 
+            current_text = (
+                utterance.get_current_text()
+            )
+
+            if not current_text:
+                continue
+
             # -------------------------------------------------
-            # DISPLAY ACCUMULATED SPEECH
+            # CREATE TURN ON FIRST FINAL SEGMENT
+            # -------------------------------------------------
+
+            with active_turn_lock:
+
+                if active_turn is None:
+
+                    active_turn = (
+                        conversation.add_turn(
+                            source_text=current_text
+                        )
+                    )
+
+                else:
+
+                    conversation.update_source_text(
+                        turn_id=active_turn.id,
+                        source_text=current_text,
+                    )
+
+                    active_turn = (
+                        conversation.get_turn(
+                            active_turn.id
+                        )
+                    )
+
+                turn = active_turn
+
+            if turn is None:
+                continue
+
+            # -------------------------------------------------
+            # GET ONLY NEW STABLE SEGMENT(S)
+            # -------------------------------------------------
+
+            new_stable_text = (
+                utterance.get_new_stable_text()
+            )
+
+            if new_stable_text:
+
+                chunk_worker.submit(
+                    text=new_stable_text,
+                    source_language=SOURCE_LANGUAGE,
+                    target_language=TARGET_LANGUAGE,
+                    turn_id=turn.id,
+                )
+
+            # -------------------------------------------------
+            # DISPLAY ACCUMULATED STABLE SOURCE
             # -------------------------------------------------
 
             if bridge is not None:
 
                 bridge.source_partial(
-                    utterance.get_current_text()
+                    current_text
                 )
 
     except Exception as exc:
 
         if bridge is not None:
-            bridge.error(str(exc))
+
+            bridge.error(
+                str(exc)
+            )
 
         raise
 
@@ -204,7 +366,11 @@ def run_translator(bridge=None):
 
         microphone.stop()
 
-        translation_worker.stop()
+        chunk_worker.stop()
+
+        final_worker.stop()
+
+        refinement_worker.stop()
 
 
 # =============================================================

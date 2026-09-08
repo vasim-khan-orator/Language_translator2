@@ -5,6 +5,16 @@ import time
 
 class TranslationWorker:
 
+    """
+    Final translation worker.
+
+    Receives completed conversation turns and sends
+    the complete utterance to Ollama.
+
+    Incremental/chunk translation and context refinement
+    are handled by separate workers.
+    """
+
     def __init__(
         self,
         translator,
@@ -93,31 +103,38 @@ class TranslationWorker:
             try:
 
                 # -------------------------------------------------
-                # START TRANSLATION TIMER
+                # START TIMER
                 # -------------------------------------------------
 
-                translation_start = time.perf_counter()
+                translation_start = (
+                    time.perf_counter()
+                )
 
                 if self.bridge is not None:
+
                     self.bridge.translation_started()
 
                 # -------------------------------------------------
-                # TRANSLATE
+                # FINAL TRANSLATION
                 # -------------------------------------------------
 
-                translated_text = self.translator.translate(
-                    turn.source_text,
-                    turn.source_language,
-                    turn.target_language,
+                translated_text, api_ms = (
+                    self.translator.translate_final(
+                        text=turn.source_text,
+                        source_language=turn.source_language,
+                        target_language=turn.target_language,
+                    )
                 )
 
                 # -------------------------------------------------
-                # END TRANSLATION TIMER
+                # END TIMER
                 # -------------------------------------------------
 
-                translation_end = time.perf_counter()
+                translation_end = (
+                    time.perf_counter()
+                )
 
-                api_ms = (
+                total_ms = (
                     translation_end
                     - translation_start
                 ) * 1000
@@ -140,7 +157,7 @@ class TranslationWorker:
                     self.bridge.translation_finished(
                         text=translated_text,
                         api_ms=api_ms,
-                        total_ms=api_ms,
+                        total_ms=total_ms,
                     )
 
                 # -------------------------------------------------

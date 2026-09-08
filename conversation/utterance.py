@@ -3,7 +3,6 @@ import threading
 
 
 class UtteranceManager:
-
     """
     Combines multiple Riva FINAL ASR segments into
     one complete user utterance.
@@ -11,11 +10,15 @@ class UtteranceManager:
     Riva FINAL means the segment is stable.
     It does NOT necessarily mean the user has
     stopped speaking.
+
+    Also keeps track of which stable segments have
+    already been consumed by the progressive
+    translation worker.
     """
 
     def __init__(
         self,
-        silence_timeout=1.2,
+        silence_timeout=0.4,
         min_utterance_length=2,
     ):
 
@@ -24,6 +27,10 @@ class UtteranceManager:
 
         self.segments = []
         self.last_final_time = None
+
+        # Number of segments already given to
+        # the progressive translation worker.
+        self._translated_segment_index = 0
 
         self._lock = threading.Lock()
 
@@ -59,6 +66,56 @@ class UtteranceManager:
             ).strip()
 
     # =========================================================
+    # GET NEW STABLE TEXT
+    # =========================================================
+
+    def get_new_stable_text(self):
+
+        """
+        Returns only Riva FINAL segments that have
+        not yet been sent to the progressive translator.
+
+        Example:
+
+            segments:
+                ["Hello", "how are you", "today"]
+
+        First call:
+            "Hello"
+
+        Second call:
+            "how are you"
+
+        Third call:
+            "today"
+
+        After that:
+            None
+        """
+
+        with self._lock:
+
+            if (
+                self._translated_segment_index
+                >= len(self.segments)
+            ):
+                return None
+
+            new_segments = self.segments[
+                self._translated_segment_index:
+            ]
+
+            self._translated_segment_index = (
+                len(self.segments)
+            )
+
+            text = " ".join(
+                new_segments
+            ).strip()
+
+            return text if text else None
+
+    # =========================================================
     # FINALIZE WHEN SILENT
     # =========================================================
 
@@ -85,7 +142,11 @@ class UtteranceManager:
             ).strip()
 
             self.segments.clear()
+
             self.last_final_time = None
+
+            # New utterance starts after this point.
+            self._translated_segment_index = 0
 
         if len(text) < self.min_utterance_length:
             return None
@@ -113,4 +174,7 @@ class UtteranceManager:
         with self._lock:
 
             self.segments.clear()
+
             self.last_final_time = None
+
+            self._translated_segment_index = 0

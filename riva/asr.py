@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from importlib import metadata, util
 from pathlib import Path
 import sys
+import time
 from typing import Iterable, Iterator
 
 from config import (
@@ -71,6 +72,7 @@ class ASRResult:
     text: str
     is_final: bool
     stability: float = 0.0
+    timestamp: float = 0.0
 
 
 class RivaASR:
@@ -177,6 +179,7 @@ class RivaASR:
                         "stability",
                         0.0
                     ),
+                    timestamp=time.perf_counter(),
                 )
 
 

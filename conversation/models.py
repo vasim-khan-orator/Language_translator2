@@ -7,6 +7,14 @@ from typing import Optional
 class ConversationTurn:
     """
     Represents one completed speech/translation turn.
+
+    A turn can receive multiple translation revisions:
+        - progressive chunk translation
+        - final translation
+        - context-aware refinement
+
+    The ConversationManager is responsible for
+    validating and applying revisions safely.
     """
 
     id: int
@@ -19,7 +27,10 @@ class ConversationTurn:
 
     translated_text: str = ""
 
-    timestamp: datetime = None
+    # Latest accepted translation revision.
+    revision: int = 0
+
+    timestamp: Optional[datetime] = None
 
     def __post_init__(self):
         if self.timestamp is None:
