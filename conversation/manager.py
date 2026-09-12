@@ -11,7 +11,7 @@ class ConversationManager:
     Thread-safe conversation state manager.
 
     Responsibilities:
-        - Store completed conversation turns.
+        - Store conversation turns.
         - Generate unique turn IDs.
         - Track the latest translation revision for each turn.
         - Prevent stale asynchronous translation results from
@@ -28,6 +28,11 @@ class ConversationManager:
         self.target_language = target_language
 
         self.history: List[ConversationTurn] = []
+
+        # O(1) turn lookup for concurrent workers.
+        # The ConversationTurn objects remain the same objects stored in
+        # ``history`` so existing callers keep their current behavior.
+        self._turns_by_id = {}
 
         self._next_id = 1
 
@@ -61,6 +66,7 @@ class ConversationManager:
             )
 
             self.history.append(turn)
+            self._turns_by_id[turn.id] = turn
 
             self._next_id += 1
 
@@ -95,13 +101,7 @@ class ConversationManager:
         """
 
         with self._lock:
-
-            for turn in self.history:
-
-                if turn.id == turn_id:
-                    return turn
-
-        return None
+            return self._turns_by_id.get(turn_id)
 
     # =========================================================
     # UPDATE SOURCE TEXT
@@ -115,8 +115,8 @@ class ConversationManager:
         """
         Update the source text of an active conversation turn.
 
-        During streaming speech, the same turn is progressively
-        extended as new Riva FINAL segments arrive.
+        During streaming speech, the same turn is updated as newer ASR
+        snapshots arrive.
         """
 
         source_text = source_text.strip()
@@ -300,7 +300,9 @@ class ConversationManager:
 
         This method does NOT call Ollama.
 
-        It only prepares context for RefinementWorker.
+        It only prepares context for RefinementWorker. The returned
+        context is bounded by ``MAX_HISTORY_LINES`` so this method
+        does not grow with the full lifetime of the application.
         """
 
         if max_lines is None:
@@ -358,6 +360,7 @@ class ConversationManager:
         with self._lock:
 
             self.history.clear()
+            self._turns_by_id.clear()
 
             self._next_id = 1
 

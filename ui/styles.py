@@ -1,19 +1,25 @@
 WINDOW_TITLE = "Real-Time Language Translator"
 
-WINDOW_WIDTH = 1100
-WINDOW_HEIGHT = 700
+WINDOW_WIDTH = 1180
+WINDOW_HEIGHT = 820
 
-BACKGROUND = "#1e1e1e"
-PANEL_BACKGROUND = "#252526"
-TEXT_BACKGROUND = "#181818"
+# Reference-style dark blue conversation screen.
+BACKGROUND = "#183B70"
+PANEL_BACKGROUND = "#1E477F"
+TEXT_BACKGROUND = "#183B70"
 
-TEXT_COLOR = "#ffffff"
-SECONDARY_TEXT = "#aaaaaa"
+TEXT_COLOR = "#FFFFFF"
+SOURCE_TEXT_COLOR = "#D7E2F2"
+SECONDARY_TEXT = "#AFC1D8"
 ACCENT_COLOR = "#4CAF50"
 WARNING_COLOR = "#FFC107"
+BORDER_COLOR = "#365E91"
+BUTTON_BACKGROUND = "#315D96"
 
 FONT_TITLE = ("Arial", 22, "bold")
-FONT_SECTION = ("Arial", 14, "bold")
-FONT_TEXT = ("Arial", 16)
-FONT_SMALL = ("Arial", 11)
-FONT_METRIC = ("Arial", 13)
+FONT_LANGUAGE = ("Arial", 13, "bold")
+FONT_SOURCE = ("Arial", 17)
+FONT_TRANSLATION = ("Arial", 22, "bold")
+FONT_SMALL = ("Arial", 10)
+FONT_METRIC = ("Arial", 11)
+FONT_STATUS = ("Arial", 12, "bold")

@@ -81,14 +81,14 @@ SILENCE_TIMEOUT = float(
 CHUNK_MAX_WORKERS = int(
     os.getenv(
         "CHUNK_MAX_WORKERS",
-        "3"
+        "1"
     )
 )
 
 REFINEMENT_MAX_WORKERS = int(
     os.getenv(
         "REFINEMENT_MAX_WORKERS",
-        "2"
+        "1"
     )
 )
 
@@ -100,7 +100,7 @@ REFINEMENT_MAX_WORKERS = int(
 CHUNK_INTERVAL = float(
     os.getenv(
         "CHUNK_INTERVAL",
-        "0.15"
+        "0.5"
     )
 )
 
@@ -112,6 +112,6 @@ CHUNK_INTERVAL = float(
 REFINEMENT_INTERVAL = float(
     os.getenv(
         "REFINEMENT_INTERVAL",
-        "1.2"
+        "3.0"
     )
 )

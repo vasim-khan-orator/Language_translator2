@@ -1,94 +1,103 @@
+import json
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+
+import requests
+
+from config import OLLAMA_URL, OLLAMA_MODEL
 
 
 class ChunkWorker:
     """
-    Concurrent progressive translation worker.
+    Hidden background chunk prefetch worker.
 
-    Receives stable Riva FINAL ASR segments and translates
-    progressive source windows using a bounded thread pool.
+    A stable Riva FINAL segment is fed into a small word buffer.
+    Whenever the buffer contains enough words, one small chunk is
+    removed from the buffer and dispatched immediately on its own
+    background request thread.
 
-    Design:
+    There is intentionally NO shared worker-pool queue between chunks.
+    Chunk N+1 never waits for Chunk N in Python.
 
-        Riva FINAL
-             |
-             v
-        ChunkWorker
-             |
-        +----+----+----------------
-        |         |               |
-        v         v               v
-     Ollama    Ollama          Ollama
-     worker 1  worker 2        worker 3
+    Example with chunk_words=3:
 
-    When all workers are busy, only the newest pending
-    source window is retained.
+        Riva FINAL: "I went to the"
+                       ↓
+        request 0:   "I went to"
+        buffer:      "the"
 
-    Translation results are protected using ConversationManager
-    revisions so older responses cannot overwrite newer ones.
+    A later stable segment extends the buffer and another chunk is
+    dispatched.
+
+    Important finalization behavior:
+
+        live chunk(s) may still be running
+                    ↓
+        utterance ends
+                    ↓
+        finalize_turn()
+                    ↓
+        already-running chunk requests are allowed to finish
+                    ↓
+        their responses fill their reserved UI slots
+                    ↓
+        FinalTranslationWorker starts immediately
+
+    We intentionally do NOT wait for the last chunk.
     """
 
     def __init__(
         self,
-        translator,
+        translator=None,
         conversation=None,
         bridge=None,
         max_workers=3,
-        chunk_interval=0.15,
+        chunk_words=3,
     ):
 
+        # Kept for constructor compatibility, but this worker does
+        # NOT use the shared OllamaTranslator anymore.
         self.translator = translator
         self.conversation = conversation
         self.bridge = bridge
 
-        self.max_workers = max_workers
-        self.chunk_interval = chunk_interval
+        self.ollama_url = OLLAMA_URL.rstrip("/")
+        self.ollama_model = OLLAMA_MODEL
+        self.keep_alive = "30m"
+        self.temperature = 0.0
+        self.num_predict = 40
 
-        # =====================================================
-        # INPUT QUEUE
-        # =====================================================
+        # One HTTP session per worker thread.
+        self._http_local = threading.local()
 
-        self._queue = queue.Queue()
+        self.max_workers = max(
+            1,
+            int(max_workers),
+        )
 
-        # =====================================================
-        # THREAD / STATE
-        # =====================================================
+        self.chunk_words = max(
+            1,
+            int(chunk_words),
+        )
 
-        self._thread = None
+        # Each chunk gets its own request thread. This removes the
+        # Python-side max_workers bottleneck completely.
+        self._chunk_threads = set()
+
         self._running = False
-
         self._lock = threading.RLock()
 
-        # =====================================================
-        # OLLAMA EXECUTOR
-        # =====================================================
-
-        self._executor = None
-
-        # Number of currently running Ollama requests.
-        self._in_flight = 0
-
-        # =====================================================
-        # CURRENT TURN
-        # =====================================================
-
-        self._current_turn_id = None
-
-        self._source_segments = []
-
-        self._last_submitted_segment = ""
-
-        # =====================================================
-        # LATEST PENDING SOURCE WINDOW
-        # =====================================================
-
-        self._pending_source = None
-
-        # Used for the 100-200 ms progressive scheduling window.
-        self._last_dispatch_time = 0.0
+        # turn_id -> state
+        #
+        # {
+        #     "generation": int,
+        #     "buffer": [words],
+        #     "next_sequence": int,
+        #     "completed": {sequence: result},
+        #     "finalized": bool,
+        # }
+        self._turns = {}
 
     # =========================================================
     # START
@@ -103,22 +112,11 @@ class ChunkWorker:
 
             self._running = True
 
-            # Create a fresh executor every time the worker starts.
-            self._executor = ThreadPoolExecutor(
-                max_workers=self.max_workers
-            )
-
-            self._in_flight = 0
-
-            self._thread = threading.Thread(
-                target=self._run,
-                daemon=True,
-            )
-
-            self._thread.start()
+            self._chunk_threads.clear()
+            self._turns.clear()
 
     # =========================================================
-    # SUBMIT
+    # SUBMIT NEW STABLE SEGMENT
     # =========================================================
 
     def submit(
@@ -128,51 +126,112 @@ class ChunkWorker:
         target_language,
         turn_id,
     ):
-        """
-        Submit one stable Riva FINAL segment.
 
-        turn_id is intentionally required.
+        text = (text or "").strip()
 
-        main.py should create the ConversationTurn when
-        the first stable segment of an utterance arrives.
-        """
-
-        if not self._running:
+        if not text or turn_id is None:
             return
 
-        text = text.strip()
+        with self._lock:
 
-        if not text:
-            return
+            if not self._running:
+                return
 
-        self._queue.put(
-            (
-                "segment",
-                text,
-                source_language,
-                target_language,
+            state = self._turns.setdefault(
                 turn_id,
+                self._new_state(),
             )
-        )
+
+            # A finalized turn must never accept another chunk.
+            if state["finalized"]:
+                return
+
+            # Add ONLY the newly stable segment.
+            state["buffer"].extend(
+                text.split()
+            )
+
+            # Dispatch every complete chunk immediately.
+            while len(state["buffer"]) >= self.chunk_words:
+
+                words = state["buffer"][
+                    :self.chunk_words
+                ]
+
+                del state["buffer"][
+                    :self.chunk_words
+                ]
+
+                fragment = " ".join(words).strip()
+
+                if not fragment:
+                    continue
+
+                self._dispatch_locked(
+                    turn_id=turn_id,
+                    state=state,
+                    fragment=fragment,
+                    source_language=source_language,
+                    target_language=target_language,
+                )
+
+    # =========================================================
+    # FINALIZE TURN
+    # =========================================================
+
+    def finalize_turn(
+        self,
+        turn_id,
+    ):
+
+        if turn_id is None:
+            return
+
+        with self._lock:
+
+            state = self._turns.get(
+                turn_id
+            )
+
+            if state is None:
+                return
+
+            if state["finalized"]:
+                return
+
+            # Mark the turn closed for NEW chunk submissions.
+            #
+            # IMPORTANT:
+            # We do NOT invalidate already-running chunk requests here.
+            # They are allowed to finish and reach the UI. The final
+            # translation is authoritative and the UIBridge will ignore
+            # any chunk event that arrives after the final event.
+            state["finalized"] = True
+
+            # The incomplete tail is provisional. Do not dispatch it now;
+            # the FinalTranslationWorker will translate the complete
+            # sentence.
+            state["buffer"].clear()
 
     # =========================================================
     # RESET TURN
     # =========================================================
 
-    def reset_turn(self):
+    def reset_turn(
+        self,
+        turn_id=None,
+    ):
 
-        if not self._running:
-            return
+        with self._lock:
 
-        self._queue.put(
-            (
-                "reset",
-                None,
-                None,
-                None,
+            if turn_id is None:
+                self._turns.clear()
+                return
+
+            self._turns.pop(
+                turn_id,
                 None,
             )
-        )
 
     # =========================================================
     # STOP
@@ -187,344 +246,360 @@ class ChunkWorker:
 
             self._running = False
 
-            self._queue.put(
-                (
-                    "stop",
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            )
+            # Invalidate every active generation.
+            for state in self._turns.values():
+                state["generation"] += 1
+                state["finalized"] = True
+                state["buffer"].clear()
 
-        if self._thread is not None:
-
-            self._thread.join(
-                timeout=2
-            )
-
-            self._thread = None
-
-        executor = None
-
-        with self._lock:
-
-            executor = self._executor
-            self._executor = None
-
-        if executor is not None:
-
-            executor.shutdown(
-                wait=False,
-                cancel_futures=True,
-            )
+            # Existing per-chunk request threads are daemon threads.
+            # Do not wait for them here. They will finish naturally and
+            # their stale generation will prevent any post-stop UI update.
+            self._turns.clear()
+            self._chunk_threads.clear()
 
     # =========================================================
-    # WORKER LOOP
+    # STATE FACTORY
     # =========================================================
 
-    def _run(self):
+    @staticmethod
+    def _new_state():
 
-        while True:
+        return {
+            "generation": 0,
+            "buffer": [],
+            "next_sequence": 0,
+            "completed": {},
+            "finalized": False,
+        }
 
-            try:
+    # =========================================================
+    # DISPATCH
+    # =========================================================
 
-                item = self._queue.get(
-                    timeout=0.02
-                )
+    def _dispatch_locked(
+        self,
+        turn_id,
+        state,
+        fragment,
+        source_language,
+        target_language,
+    ):
 
-            except queue.Empty:
+        if not self._running:
+            return
 
-                self._try_dispatch_pending()
+        sequence = state["next_sequence"]
+        state["next_sequence"] += 1
+        generation = state["generation"]
 
-                continue
-
-            event_type = item[0]
-
-            # -------------------------------------------------
-            # STOP
-            # -------------------------------------------------
-
-            if event_type == "stop":
-                break
-
-            # -------------------------------------------------
-            # RESET
-            # -------------------------------------------------
-
-            if event_type == "reset":
-
-                with self._lock:
-
-                    self._current_turn_id = None
-                    self._source_segments.clear()
-                    self._last_submitted_segment = ""
-                    self._pending_source = None
-
-                continue
-
-            # -------------------------------------------------
-            # STABLE SEGMENT
-            # -------------------------------------------------
-
-            (
-                _,
-                text,
+        # IMPORTANT:
+        # Start this chunk immediately on its own thread.
+        # There is NO waiting for another chunk to finish.
+        worker_thread = threading.Thread(
+            target=self._run_chunk_request,
+            args=(
+                turn_id,
+                generation,
+                sequence,
+                fragment,
                 source_language,
                 target_language,
-                turn_id,
-            ) = item
+            ),
+            daemon=True,
+            name=f"chunk-{turn_id}-{sequence}",
+        )
 
-            # -------------------------------------------------
-            # DUPLICATE PROTECTION
-            # -------------------------------------------------
+        self._chunk_threads.add(worker_thread)
+        worker_thread.start()
 
-            if text == self._last_submitted_segment:
-                continue
+        print(
+            "[ChunkWorker] "
+            f"dispatch turn={turn_id} "
+            f"chunk={sequence} "
+            f"generation={generation} "
+            f"text={fragment!r}"
+        )
 
-            self._last_submitted_segment = text
+    # =========================================================
+    # RUN ONE CHUNK REQUEST
+    # =========================================================
 
-            # -------------------------------------------------
-            # NEW TURN
-            # -------------------------------------------------
+    def _run_chunk_request(
+        self,
+        turn_id,
+        generation,
+        sequence,
+        fragment,
+        source_language,
+        target_language,
+    ):
+        current_thread = threading.current_thread()
 
-            if turn_id != self._current_turn_id:
+        try:
+            result = self._translate(
+                turn_id=turn_id,
+                generation=generation,
+                sequence=sequence,
+                fragment=fragment,
+                source_language=source_language,
+                target_language=target_language,
+            )
+        except Exception as exc:
+            result = {
+                "turn_id": turn_id,
+                "generation": generation,
+                "sequence": sequence,
+                "fragment": fragment,
+                "translation": "",
+                "api_ms": 0.0,
+                "error": str(exc),
+            }
 
-                with self._lock:
+        self._finished(
+            turn_id,
+            generation,
+            sequence,
+            result,
+        )
 
-                    self._current_turn_id = turn_id
+        with self._lock:
+            self._chunk_threads.discard(current_thread)
 
-                    self._source_segments.clear()
+    # =========================================================
+    # TRANSLATE
+    # =========================================================
 
-                    self._pending_source = None
+    def _translate(
+        self,
+        turn_id,
+        generation,
+        sequence,
+        fragment,
+        source_language,
+        target_language,
+    ):
+        """
+        Perform one hidden chunk translation.
 
-            # -------------------------------------------------
-            # ADD STABLE SOURCE
-            # -------------------------------------------------
+        The returned translation is deliberately kept inside the
+        worker. It is NOT sent to the UI and does NOT update the
+        ConversationManager. This prevents the hidden prefetch work
+        from stealing translation revisions from FinalTranslationWorker.
+        """
 
-            self._source_segments.append(
-                text
+        try:
+
+            translated_text, api_ms = self._translate_direct(
+                fragment=fragment,
+                source_language=source_language,
+                target_language=target_language,
             )
 
-            source_text = " ".join(
-                self._source_segments
-            ).strip()
+            return {
+                "turn_id": turn_id,
+                "generation": generation,
+                "sequence": sequence,
+                "fragment": fragment,
+                "translation": (
+                    translated_text or ""
+                ).strip(),
+                "api_ms": api_ms,
+                "error": None,
+            }
 
-            if not source_text:
-                continue
+        except Exception as exc:
 
-            # -------------------------------------------------
-            # SAVE AS LATEST PENDING WINDOW
-            # -------------------------------------------------
-
-            with self._lock:
-
-                self._pending_source = (
-                    source_text,
-                    source_language,
-                    target_language,
-                    turn_id,
-                )
-
-            # -------------------------------------------------
-            # TRY TO DISPATCH
-            # -------------------------------------------------
-
-            self._try_dispatch_pending()
+            return {
+                "turn_id": turn_id,
+                "generation": generation,
+                "sequence": sequence,
+                "fragment": fragment,
+                "translation": "",
+                "api_ms": 0.0,
+                "error": str(exc),
+            }
 
     # =========================================================
-    # DISPATCH PENDING REQUEST
+    # DIRECT OLLAMA API
     # =========================================================
 
-    def _try_dispatch_pending(self):
+    def _get_http_session(self):
+        session = getattr(
+            self._http_local,
+            "session",
+            None,
+        )
+
+        if session is None:
+            session = requests.Session()
+            self._http_local.session = session
+
+        return session
+
+    def _translate_direct(
+        self,
+        fragment,
+        source_language,
+        target_language,
+    ):
+        """
+        Send the hidden chunk directly to Ollama.
+
+        This request path belongs exclusively to ChunkWorker.
+        It does not call OllamaTranslator.
+        """
+
+        fragment = (fragment or "").strip()
+
+        if not fragment:
+            return "", 0.0
+
+        prompt = f"""Translate {source_language} to {target_language}.
+Return ONLY the translation of the text below.
+Translate only what is provided.
+Do not complete the sentence.
+Do not explain, answer, or add words.
+
+Text:
+{fragment}
+
+Translation:
+"""
+
+        started = time.perf_counter()
+
+        response = self._get_http_session().post(
+            f"{self.ollama_url}/api/generate",
+            json={
+                "model": self.ollama_model,
+                "prompt": prompt,
+                "stream": True,
+                "keep_alive": self.keep_alive,
+                "options": {
+                    "temperature": self.temperature,
+                    "num_predict": self.num_predict,
+                },
+            },
+            timeout=60,
+            stream=True,
+        )
+
+        try:
+            response.raise_for_status()
+
+            parts = []
+
+            for raw_line in response.iter_lines(
+                decode_unicode=True
+            ):
+                if not raw_line:
+                    continue
+
+                try:
+                    data = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+
+                piece = data.get("response", "")
+
+                if piece:
+                    parts.append(piece)
+
+                if data.get("done"):
+                    break
+
+            text = "".join(parts).strip()
+
+            api_ms = (
+                time.perf_counter() - started
+            ) * 1000
+
+            print(
+                "[ChunkWorker API] "
+                f"turn-independent chunk request "
+                f"HTTP={api_ms:.0f} ms"
+            )
+
+            return text, api_ms
+
+        finally:
+            response.close()
+
+    # =========================================================
+    # RESULT CALLBACK
+    # =========================================================
+
+    def _finished(
+        self,
+        turn_id,
+        generation,
+        sequence,
+        result,
+    ):
 
         with self._lock:
 
             if not self._running:
                 return
 
-            if self._pending_source is None:
+            state = self._turns.get(turn_id)
+
+            if state is None:
                 return
 
-            if self._executor is None:
-                return
-
-            # All workers are occupied.
-            # Keep the newest source window pending.
-            if self._in_flight >= self.max_workers:
-                return
-
-            now = time.perf_counter()
-
-            elapsed = (
-                now
-                - self._last_dispatch_time
-            )
-
-            # Avoid firing requests faster than the configured
-            # progressive interval.
-            if (
-                self._last_dispatch_time > 0
-                and elapsed < self.chunk_interval
-            ):
-                return
-
-            (
-                source_text,
-                source_language,
-                target_language,
-                turn_id,
-            ) = self._pending_source
-
-            self._pending_source = None
-
-            # -------------------------------------------------
-            # RESERVE REVISION
-            # -------------------------------------------------
-
-            revision = None
-
-            if (
-                self.conversation is not None
-                and turn_id is not None
-            ):
-
-                revision = (
-                    self.conversation.reserve_revision(
-                        turn_id
-                    )
+            if state["generation"] != generation:
+                print(
+                    "[ChunkWorker] "
+                    f"discard stale chunk={sequence} "
+                    f"turn={turn_id}"
                 )
+                return
 
-                if revision is None:
+            # IMPORTANT:
+            # Do NOT wait for earlier chunks here.
+            # Every completed API request gets its own sequence slot.
+            state["completed"][sequence] = result
 
-                    return
+            visible = result.get("translation") or ""
+            api_ms = result.get("api_ms", 0.0)
 
-            # -------------------------------------------------
-            # MARK REQUEST IN FLIGHT
-            # -------------------------------------------------
-
-            self._in_flight += 1
-
-            self._last_dispatch_time = now
-
-            # -------------------------------------------------
-            # START ASYNC OLLAMA REQUEST
-            # -------------------------------------------------
-
-            self._executor.submit(
-                self._translate,
-                source_text,
-                source_language,
-                target_language,
-                turn_id,
-                revision,
+        # The UI bridge owns the slots/order. This callback returns
+        # immediately for each finished request; chunk 4 can appear
+        # even when chunk 0 is still running.
+        if self.bridge is not None:
+            self.bridge.translation_chunk(
+                text=visible.strip(),
+                turn_id=turn_id,
+                sequence=sequence,
+                api_ms=api_ms,
+                total_ms=api_ms,
             )
 
-    # =========================================================
-    # OLLAMA TRANSLATION
-    # =========================================================
-
-    def _translate(
-        self,
-        source_text,
-        source_language,
-        target_language,
-        turn_id,
-        revision,
-    ):
-
-        try:
-
-            if self.bridge is not None:
-
-                self.bridge.translation_started()
-
-            translation_start = (
-                time.perf_counter()
-            )
-
-            translated_text, api_ms = (
-                self.translator.translate_chunk(
-                    text=source_text,
-                    source_language=source_language,
-                    target_language=target_language,
-                )
-            )
-
-            translation_end = (
-                time.perf_counter()
-            )
-
-            total_ms = (
-                translation_end
-                - translation_start
-            ) * 1000
-
-            # -------------------------------------------------
-            # CHECK WHETHER RESULT IS STILL CURRENT
-            # -------------------------------------------------
-
-            accepted = True
-
-            if (
-                self.conversation is not None
-                and turn_id is not None
-                and revision is not None
-            ):
-
-                accepted = (
-                    self.conversation.apply_translation(
-                        turn_id=turn_id,
-                        translated_text=translated_text,
-                        revision=revision,
-                    )
-                )
-
-            # -------------------------------------------------
-            # DISPLAY ONLY CURRENT RESULT
-            # -------------------------------------------------
-
-            if accepted:
-
-                if self.bridge is not None:
-
-                    self.bridge.translation_chunk(
-                        text=translated_text,
-                        turn_id=turn_id,
-                        revision=revision,
-                        api_ms=api_ms,
-                        total_ms=total_ms,
-                    )
-
-        except Exception as exc:
-
+        if visible.strip():
             print(
-                f"[ChunkWorker] {exc}"
+                "[ChunkWorker] "
+                f"visible chunk={sequence} "
+                f"turn={turn_id} "
+                f"text={visible.strip()!r}"
             )
 
-            if self.bridge is not None:
+        if result.get("error"):
+            print(
+                "[ChunkWorker] "
+                f"chunk={sequence} "
+                f"turn={turn_id} "
+                f"error={result['error']}"
+            )
 
-                self.bridge.error(
-                    str(exc)
-                )
+    # =========================================================
+    # SEQUENCE / SLOT INFO
+    # =========================================================
 
-        finally:
-
-            if self.bridge is not None:
-                self.bridge.translation_completed()
-
-            # -------------------------------------------------
-            # RELEASE WORKER SLOT
-            # -------------------------------------------------
-
-            with self._lock:
-
-                if self._in_flight > 0:
-
-                    self._in_flight -= 1
-
-            # -------------------------------------------------
-            # Immediately try the newest pending source.
-            # -------------------------------------------------
-
-            self._try_dispatch_pending()
+    def get_dispatched_count(self, turn_id):
+        """Return the highest chunk sequence dispatched for this turn."""
+        with self._lock:
+            state = self._turns.get(turn_id)
+            if state is None:
+                return -1
+            return state["next_sequence"] - 1
